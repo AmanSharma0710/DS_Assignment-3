@@ -124,6 +124,12 @@ Sample response:
 def init():
     content = request.json
     # print(content)
+
+    # check if 'N', 'schema', 'shards' and 'servers' exist in content
+    if 'N' not in content or 'schema' not in content or 'shards' not in content or 'servers' not in content:
+        message = '<ERROR> N, schema, shards or servers not present in request'
+        return jsonify({'message': message, 'status': 'failure'}), 400
+    
     n = content['N'] # Number of servers
     global studT_schema
     studT_schema = content['schema'] # Schema of the database
@@ -270,6 +276,12 @@ Response Code = 200
 @app.route('/add', methods=['POST'])
 def add():
     content = request.json
+
+    # check if 'n', 'new_shards' and 'servers' exist in content
+    if 'n' not in content or 'new_shards' not in content or 'servers' not in content:
+        message = '<ERROR> n, new_shards or servers not present in request'
+        return jsonify({'message': message, 'status': 'failure'}), 400
+    
     n = content['n']
     new_shards = content['new_shards']
     shard_mapping = content['servers']
@@ -331,6 +343,12 @@ def add():
 @app.route('/rm', methods=['DELETE'])
 def remove():
     content = request.json
+
+    # check if 'n' and 'servers' exist in content
+    if 'n' not in content or 'servers' not in content:
+        message = '<ERROR> n or servers not present in request'
+        return jsonify({'message': message, 'status': 'failure'}), 400
+    
     n = content['n']
     hostnames = content['servers']
     if len(hostnames) > n:
@@ -439,6 +457,17 @@ def remove():
 @app.route('/read', methods=['POST'])
 def read():
     content = request.json
+
+    # check if 'Stud_id' exists in content
+    if 'Stud_id' not in content:
+        message = '<ERROR> Stud_id not present in request'
+        return jsonify({'message': message, 'status': 'failure'}), 400
+    
+    # check if 'low' and 'high' exist in content['Stud_id']
+    if 'low' not in content['Stud_id'] or 'high' not in content['Stud_id']:
+        message = '<ERROR> low or high not present in Stud_id'
+        return jsonify({'message': message, 'status': 'failure'}), 400
+    
     stud_id_low = content['Stud_id']['low']
     stud_id_high = content['Stud_id']['high']
 
@@ -497,6 +526,11 @@ def read():
 @app.route('/write', methods=['POST'])
 def write():
     content = request.json
+
+    # check if 'data' exists in content
+    if 'data' not in content:
+        message = '<ERROR> data not present in request'
+        return jsonify({'message': message, 'status': 'failure'}), 400
     data = content['data']
 
     # Sort the data by Stud_id
@@ -571,6 +605,12 @@ def write():
 @app.route('/update', methods=['PUT'])
 def update():
     content = request.json
+    # check if 'Stud_id' and 'data' exist in content
+
+    if 'data' not in content or 'Stud_id' not in content:
+        message = '<ERROR> Stud_id or data not present in request'
+        return jsonify({'message': message, 'status': 'failure'}), 400
+
     stud_id = content['Stud_id']
     new_data = content['data']
 
@@ -623,6 +663,12 @@ def update():
 @app.route('/del', methods=['DELETE'])
 def delete():
     content = request.json
+
+    # check if 'Stud_id' exists in content
+    if 'Stud_id' not in content:
+        message = '<ERROR> Stud_id not present in request'
+        return jsonify({'message': message, 'status': 'failure'}), 400
+    
     Stud_id = content['Stud_id']
 
     # Find the shard that contains the data
@@ -738,7 +784,7 @@ def respawn_server(replica):
         shard_data = []
         try:
             print(f'http://{server}:{serverport}/copy', flush=True)
-            reply = requests.post(f'http://{server}:{serverport}/copy', json = {
+            reply = requests.get(f'http://{server}:{serverport}/copy', json = {
                 "shards": [id],
             })
             data = reply.json()

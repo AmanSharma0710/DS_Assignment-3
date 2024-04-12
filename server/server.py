@@ -206,7 +206,7 @@ Response Json:
 },
 Response Code = 200
 '''
-@app.route('/delete', methods=['DELETE'])
+@app.route('/del', methods=['DELETE'])
 def delete():
     data = request.json
     shard = data['shard']
