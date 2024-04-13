@@ -10,6 +10,7 @@ RUN mkdir /src
 WORKDIR /src
 COPY server.py /src/server.py
 COPY deploy.sh /src/deploy.sh
+COPY logger.py /src/logger.py
 COPY requirements.txt /src/requirements.txt
 
 RUN pip install -r requirements.txt
