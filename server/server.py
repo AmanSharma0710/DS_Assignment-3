@@ -2,26 +2,15 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import mysql.connector
+import datetime
+
+from logger import Logger
 
 app = Flask(__name__)
 CORS(app)
 
 # For testing purposes, you can set the server ID as an environment variable while running the container instance of the server.
 # os.environ['SERVER_ID'] = '1231'
-
-# Connect to the MySQL database
-mydb = mysql.connector.connect(
-    host="localhost", 
-    user="root",
-    password="abc")
-mycursor = mydb.cursor(dictionary=True)
-# Create a database to store the shards
-# if database exists clear the database
-mycursor.execute("DROP DATABASE IF EXISTS shards;")
-mycursor.execute("CREATE DATABASE shards;")
-mycursor.execute("USE shards;")
-print("Database created")
-
 
 '''
 (/config,method=POST): This endpoint initializes the shard tables in the server database after the container
@@ -41,6 +30,12 @@ Response Code = 200
 ''' 
 @app.route('/config', methods=['POST'])
 def config():
+    mydb = mysql.connector.connect(
+        host="localhost", 
+        user="root",
+        password="abc",
+        database="shards")
+    mycursor = mydb.cursor(dictionary=True)
     data = request.json
     shards = data['shards']
     schema = data['schema']
@@ -60,6 +55,8 @@ def config():
         for i in range(1, len(columns)):
             mycursor.execute("ALTER TABLE {} ADD COLUMN {} {};".format(shard, columns[i], dtypes[i]))
     mydb.commit()
+    mycursor.close()
+    mydb.close()
     message = ''
     for i in range(len(shards)):
         message += 'Server{}:{}'.format(server_id, shards[i])
@@ -97,6 +94,12 @@ Response Code = 200
 '''
 @app.route('/copy', methods=['GET'])
 def copy():
+    mydb = mysql.connector.connect(
+        host="localhost", 
+        user="root",
+        password="abc",
+        database="shards")
+    mycursor = mydb.cursor(dictionary=True)
     data = request.json
     shards = data['shards']
     response = {}
@@ -104,6 +107,8 @@ def copy():
         mycursor.execute("SELECT * FROM {};".format(shard))
         response[shard] = mycursor.fetchall()
     response['status'] = 'success'
+    mycursor.close()
+    mydb.close()
     return jsonify(response), 200
 
 '''
@@ -126,12 +131,21 @@ Response Code = 200
 '''
 @app.route('/read', methods=['POST'])
 def read():
+    mydb = mysql.connector.connect(
+        host="localhost", 
+        user="root",
+        password="abc",
+        database="shards")
+    mycursor = mydb.cursor(dictionary=True)
     data = request.json
     shard = data['shard']
     low = data['Stud_id']['low']
     high = data['Stud_id']['high']
     mycursor.execute("SELECT * FROM {} WHERE Stud_id BETWEEN {} AND {};".format(shard, low, high))
     response = mycursor.fetchall()
+    mycursor.close()
+    mydb.close()
+    response = response if (len(response) > 0) else []
     return jsonify({'data': response, 'status': 'success'}), 200
 
 
@@ -153,6 +167,12 @@ Response Code = 200
 '''
 @app.route('/write', methods=['POST'])
 def write():
+    mydb = mysql.connector.connect(
+        host="localhost", 
+        user="root",
+        password="abc",
+        database="shards")
+    mycursor = mydb.cursor(dictionary=True)
     data = request.json
     shard = data['shard']
     curr_idx = data['curr_idx']
@@ -162,6 +182,8 @@ def write():
         values = ', '.join(['"{}"'.format(str(x)) for x in entry.values()])
         mycursor.execute("INSERT INTO {} ({}) VALUES ({});".format(shard, columns, values))
     mydb.commit()
+    mycursor.close()
+    mydb.close()
     return jsonify({'message': 'Data entries added', 'current_idx': curr_idx + len(entries), 'status': 'success'}), 200
 
 
@@ -182,6 +204,12 @@ Response Code = 200
 '''
 @app.route('/update', methods=['PUT'])
 def update():
+    mydb = mysql.connector.connect(
+        host="localhost", 
+        user="root",
+        password="abc",
+        database="shards")
+    mycursor = mydb.cursor(dictionary=True)
     data = request.json
     shard = data['shard']
     Stud_id = data['Stud_id']
@@ -189,6 +217,8 @@ def update():
     update = ', '.join(['{} = "{}"'.format(k, v) for k, v in entry.items()])
     mycursor.execute("UPDATE {} SET {} WHERE Stud_id = {}".format(shard, update, Stud_id))
     mydb.commit()
+    mycursor.close()
+    mydb.close()
     return jsonify({'message': 'Data entry for Stud_id:{} updated'.format(Stud_id), 'status': 'success'}), 200
 
 
@@ -208,13 +238,45 @@ Response Code = 200
 '''
 @app.route('/del', methods=['DELETE'])
 def delete():
+    mydb = mysql.connector.connect(
+        host="localhost", 
+        user="root",
+        password="abc",
+        database="shards")
+    mycursor = mydb.cursor(dictionary=True)
     data = request.json
     shard = data['shard']
     Stud_id = data['Stud_id']
     mycursor.execute("DELETE FROM {} WHERE Stud_id = {}".format(shard, Stud_id))
     mydb.commit()
+    mycursor.close()
+    mydb.close()
     return jsonify({'message': 'Data entry with Stud_id:{} removed'.format(Stud_id), 'status': 'success'}), 200
 
 
 if __name__ == '__main__':
+    
+    # Connect to the MySQL database
+    mydb = mysql.connector.connect(
+        host="localhost", 
+        user="root",
+        password="abc")
+    mycursor = mydb.cursor(dictionary=True)
+    # Create a database to store the shards
+    # if database exists clear the database
+    mycursor.execute("DROP DATABASE IF EXISTS shards;")
+    mycursor.execute("CREATE DATABASE shards;")
+    mycursor.execute("USE shards;")
+    print("Database created")
+    mycursor.close()
+    mydb.close()
+
+    # create a logs directory
+    os.makedirs('logs', exist_ok=True)
+    # Initialize the logger
+    # Log = Logger(os.environ['SERVER_ID'])
+
+    # Log messages follow the format:
+    # "timestamp: endpoint, payload: {}"`
+
     app.run(host='0.0.0.0', port=5000, debug=True)
