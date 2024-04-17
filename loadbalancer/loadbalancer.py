@@ -10,11 +10,8 @@ import threading
 import time
 import mysql.connector
 
-
 sys.path.append('../utils')
 from hashring import HashRing
-write_results = {}
-write_results_lock = threading.Lock()
 
 app = Flask(__name__)
 CORS(app)
@@ -22,14 +19,49 @@ replica_lock = threading.Lock() # Lock for the replicas list
 shard_to_hr = {} # This dictionary will map the shard_id to hashring. key: shard_id, value: (hashring)
 shard_to_hrlock = {} # Lock for the shard_to_hr dictionary
 shard_datalock = {} # Lock for the shard data
-server_locks = {} # Locks for the servers
+# server_locks = {} # Locks for the servers
 # shardid_to_idx = {} # This dictionary will map the shard_id to the index in the shards list
 # shardid_to_idxlock = {} # Locks for the shardid_to_idx dictionary
+
+def conduct_election(shard):
+    try:
+        reply = requests.get(f'http://shardmanager:5001/election/{shard}')
+    except requests.exceptions.ConnectionError:
+        message = '<ERROR> Shard Manager not responding. Election Failed '
+        return jsonify({'message': message, 'status': 'failure'}), 400
+    if reply.status_code != 200:
+        message = f'<ERROR> Election failed for shard {shard}'
+        return jsonify({'message': message, 'status': 'failure'}), 400
+    primary_server = reply.json()['primary']
+    mydb = mysql.connector.connect(
+    host="localhost", 
+    user="root",
+    password="abc",
+    database="loadbalancer")
+    mycursor = mydb.cursor()
+
+    primary_server_name = f'Server_{primary_server}' 
+    if primary_server == None:
+        primary_server_name = 'None'
+
+    mycursor.execute(f"UPDATE ShardT SET Primary_server = '{primary_server_name}' WHERE Shard_id = '{shard}';")
+    mydb.commit()
+    mycursor.close()
+    mydb.close()
+    return reply.json()
 
 '''
 This function is called when a new server is added to the load balancer. It creates a new container with the server image and adds it to the hashring.
 '''
-def add_servers(n, shard_mapping, mycursor):
+def add_servers(n, shard_mapping):
+    
+    mydb = mysql.connector.connect(
+    host="localhost", 
+    user="root",
+    password="abc",
+    database="loadbalancer")
+    mycursor = mydb.cursor()
+
     global replicas
     hostnames = []
     for server in shard_mapping:
@@ -66,39 +98,36 @@ def add_servers(n, shard_mapping, mycursor):
             server_ids.remove(min(server_ids))
         # Generate the container name: Server_<serverid>
         container_name += str(serverid)
-        container = os.popen(f'docker run --name {container_name} --network mynet --network-alias {container_name} -e SERVER_ID={serverid} -d serverim:latest').read()
-        # wait for the container to start and initialise
-        time.sleep(5)
-        server_locks[container_name] = threading.Lock()
-
-        if len(container) == 0:
-            replica_lock.release()
-            return jsonify({'message': 'Server creation failed', 'status': 'failure'}), 400 
-        
-        replicas.append([hostnames[i], container_name])
         shards_list = shard_mapping[hostnames[i]]
         shards_list = sorted(shards_list)
+
         try:
-            data_payload = {}
-            data_payload['schema'] = studT_schema
-            data_payload['shards'] = shards_list
-            reply = requests.post(f'http://{container_name}:{serverport}/config', 
-                                    json = data_payload)
-            time.sleep(3)
-            if reply.status_code != 200:
-                replica_lock.release()
-                return jsonify({'message': 'Server configuration failed', 'status': 'failure'}), 400
+            reply = requests.post(f'http://shardmanager:5001/add_server', json = {
+                "server_id": serverid,
+                "container_name": container_name,
+                "hostname": hostnames[i],
+                "shards": shards_list,
+                "schema": studT_schema
+            })
         except requests.exceptions.ConnectionError:
             replica_lock.release()
-            return jsonify({'message': 'Server configuration failed. Connection Error', 'status': 'failure'}), 400
+            return jsonify({'message': 'Server creation failed. Connection Error', 'status': 'failure'}), 400
+        
+        if reply.status_code != 200:
+            replica_lock.release()
+            return jsonify({'message': 'Server creation failed', 'status': 'failure'}), 400
+        
+        replicas.append([hostnames[i], container_name])
         
         for shard in shards_list:
             mycursor.execute(f"INSERT INTO MapT VALUES ('{shard}', {serverid});")
-            # Add the server to the hashring
+            mydb.commit()
             shard_to_hrlock[shard].acquire()
             shard_to_hr[shard].add_server(container_name)
             shard_to_hrlock[shard].release()
-
+    
+    mycursor.close()
+    mydb.close()
     replica_lock.release()
     return jsonify({'message': 'Servers spawned and configured', 'status': 'success'}), 200
     
@@ -171,13 +200,14 @@ def init():
     mycursor.execute("USE loadbalancer;")
 
     # Create the table for the load balancer with shard_id being string
-    mycursor.execute("CREATE TABLE ShardT (Stud_id_low INT PRIMARY KEY, Shard_id VARCHAR(255), Shard_size INT);")
+    mycursor.execute("CREATE TABLE ShardT (Stud_id_low INT PRIMARY KEY, Shard_id VARCHAR(255), Shard_size INT, Primary_server VARCHAR(255));")
     mycursor.execute("CREATE TABLE MapT (Shard_id VARCHAR(255), Server_id INT);")
-    
-    # Insert the shards into the ShardT table
+    mydb.commit()
+
     for shard in shards:
-        mycursor.execute(f"INSERT INTO ShardT VALUES ({shard['Stud_id_low']}, '{shard['Shard_id']}', {shard['Shard_size']});")
-    
+        mycursor.execute(f"INSERT INTO ShardT VALUES ({shard['Stud_id_low']}, '{shard['Shard_id']}', {shard['Shard_size']}, 'None');")
+        mydb.commit()
+
     # Create locks and HashRing objects for each shard
     for shard in shards:
         id = shard['Shard_id']
@@ -193,14 +223,20 @@ def init():
         }
         shard_to_hr[shard['Shard_id']] = HashRing(hashtype = "sha256")
 
-    # Add the servers to the load balancer
-    response = add_servers(n, shard_mapping, mycursor)
-    if response[1] != 200:
-        return response
-        
-    mydb.commit()
+    
     mycursor.close()
     mydb.close()
+
+    # Add the servers to the load balancer
+    response = add_servers(n, shard_mapping)
+    if response[1] != 200:
+        return response
+    print('Adding servers done', flush=True)
+    for shard in shards:
+        reply = conduct_election(shard['Shard_id'])
+        if reply['status'] != 'success':
+            return reply
+    print('Electing primary servers done', flush=True)
     message = 'Configured Database'
     return jsonify({'message': message, 'status': 'success'}), 200
 
@@ -244,10 +280,18 @@ def status():
     
     shards_list = []
     for shard in shards:
+        server_name = shard[3]
+        replica_lock.acquire()
+        for replica in replicas:
+            if replica[1] == server_name:
+                server_name = replica[0]
+                break
+        replica_lock.release()
         shards_list.append({
             "Stud_id_low": shard[0],
             "Shard_id": shard[1],
-            "Shard_size": shard[2]
+            "Shard_size": shard[2],
+            "Primary_server": server_name
         })
     
     mycursor.execute("SELECT * FROM MapT;")
@@ -259,11 +303,8 @@ def status():
         else:
             servers_dict[shard[1]] = [shard[0]]
     
-    for replica in replicas:
-        print(replica[0], replica[1])
     servers = {}
     for server in servers_dict:
-        # Here convert the internal server names to external server names
         for replica in replicas:
             if replica[1] == f'Server_{server}':
                 servers[replica[0]] = servers_dict[server]
@@ -271,7 +312,7 @@ def status():
 
     mycursor.close()
     mydb.close()
-    return jsonify({'N': len(servers), 'schema': studT_schema, 'shards': shards_list, 'servers': servers}), 200
+    return jsonify({'N': len(servers), 'schema': studT_schema, 'shards': shards_list, 'servers': servers, }), 200
 
 '''
 (/add,method=POST): This  endpoint  adds  new  server  instances  in  the  load  balancer  to  scale  up  with increasing  client  numbers  in  the  system.  The  endpoint  expects  a  JSON  payload  that  mentions  the  number  of  newinstances, their server names, and the shard placements. An example request and response is below.
@@ -330,13 +371,12 @@ def add():
 
     # Insert the shards into the ShardT table
     for shard in new_shards:
-        mycursor.execute(f"INSERT INTO ShardT VALUES ({shard['Stud_id_low']}, '{shard['Shard_id']}', {shard['Shard_size']})")
+        mycursor.execute(f"INSERT INTO ShardT VALUES ({shard['Stud_id_low']}, '{shard['Shard_id']}', {shard['Shard_size']}, 'None');")
+        mydb.commit()
 
     for shard in new_shards:
         shard_to_hrlock[shard['Shard_id']] = threading.Lock()
         shard_to_hr[shard['Shard_id']] = HashRing(hashtype = "sha256")
-        # shardid_to_idx[shard['Shard_id']] = 0
-        # shardid_to_idxlock[shard['Shard_id']] = threading.Lock()
         shard_datalock[shard['Shard_id']] = {
                 'noReaderLock': threading.Lock(),
                 'noWaitingReaderLock': threading.Lock(),
@@ -344,20 +384,40 @@ def add():
                 'dataLock': threading.Lock(),
                 'numWriters': 0,
                 'numReaders': 0,
-                'waitingReaders': 0,
+                'waitingReaders': 0
         }
 
-
-    response = add_servers(n, shard_mapping, mycursor)
-    if response[1] != 200:
-        return response
-    
-    mydb.commit()
+    # go through all the shards in the shard_mapping
+    # if the shard is not new and has no primary server, elect a primary server
+    for server, shards_list in shard_mapping.items():
+        for shard in shards_list:
+            mycursor.execute(f"SELECT * FROM ShardT WHERE Shard_id = '{shard}';")
+            shard_info = mycursor.fetchall()
+            # if the shard is new, ignore it
+            if len(shard_info) == 0:
+                continue
+            if shard_info[0][3] == 'None':
+                new_shards.append({
+                    'Stud_id_low': shard_info[0][0],
+                    'Shard_id': shard_info[0][1],
+                    'Shard_size': shard_info[0][2]
+                })
     mycursor.close()
     mydb.close()
 
+    response = add_servers(n, shard_mapping)
+    if response[1] != 200:
+        return response
+    
+    # conduct elections for the new shards
+    for shard in new_shards:
+        reply = conduct_election(shard['Shard_id'])
+        if reply['status'] != 'success':
+            print(reply)
+            return reply
+        
     message = f'Added Servers: {", ".join(shard_mapping.keys())}'
-    return jsonify({'N': len(replicas), 'message': message, 'status': 'successful'}), 200
+    return jsonify({'N': len(replicas), 'message': message, 'status': 'success'}), 200
 
 '''
 (/rm,method=DELETE): 
@@ -400,10 +460,10 @@ def remove():
         database="loadbalancer"
     )
     mycursor = mydb.cursor()
+    shards_up_for_reelection = {}
     for replica in replicas:
         if replica[0] in hostnames:
             hostname = replica[0]
-            os.system(f'docker stop {replica[1]} && docker rm {replica[1]}')
             # Find the shard IDs that the server is responsible for
             shard_ids = []
             mycursor.execute(f"SELECT Shard_id FROM MapT WHERE Server_id = {replica[1][7:]};")
@@ -411,7 +471,10 @@ def remove():
             # Remove the server from the MapT table
             mycursor.execute(f"DELETE FROM MapT WHERE Server_id = {replica[1][7:]};")
             mydb.commit()
-
+            mycursor.execute(f"SELECT Shard_id FROM ShardT WHERE Primary_server = '{replica[1]}';")
+            shards = mycursor.fetchall()
+            for shard in shards:
+                shards_up_for_reelection[shard[0]] = True
             # Remove the server from hashrings of the shards
             server_ids.add(int(replica[1][7:]))
             for shard in shard_ids:
@@ -420,6 +483,17 @@ def remove():
                 shard_to_hr[id].remove_server(replica[1])
                 shard_to_hrlock[id].release()
             n -= 1
+            try:
+                reply = requests.delete(f'http://shardmanager:5001/remove_server', json = {
+                    "server_id": int(replica[1][7:])
+                })
+            except requests.exceptions.ConnectionError:
+                message = '<ERROR> Shard Manager not responding. Server removal failed '
+                return jsonify({'message': message, 'status': 'failure'}), 400
+            
+            if reply.status_code != 200:
+                message = f'<ERROR> Server removal failed for server {replica[1]}'
+                return jsonify({'message': message, 'status': 'failure'}), 400
         else:
             new_replicas.append(replica)
     replicas = new_replicas
@@ -433,8 +507,7 @@ def remove():
 
     for i in range(n):
         replica = replicas_tobedeleted[i]
-        os.system(f'docker stop {replica[1]} && docker rm {replica[1]}')
-        server_locks.pop(replica[1])
+        # server_locks.pop(replica[1])
         
         # Find the shard IDs that the server is responsible for
         shard_ids = []
@@ -443,6 +516,10 @@ def remove():
         # Remove the server from the MapT table
         mycursor.execute(f"DELETE FROM MapT WHERE Server_id = {replica[1][7:]};")
         mydb.commit()
+        mycursor.execute(f"SELECT Shard_id FROM ShardT WHERE Primary_server = '{replica[1]}';")
+        shards = mycursor.fetchall()
+        for shard in shards:
+            shards_up_for_reelection[shard[0]] = True
         # Remove the server from hashrings of the shards
         server_ids.add(int(replica[1][7:]))
         for shard in shard_ids:
@@ -451,8 +528,25 @@ def remove():
             shard_to_hr[id].remove_server(replica[1])
             shard_to_hrlock[id].release()
 
+        try:
+            reply = requests.delete(f'http://shardmanager:5001/remove_server', json = {
+                "server_id": int(replica[1][7:])
+            })
+        except requests.exceptions.ConnectionError:
+            message = '<ERROR> Shard Manager not responding. Server removal failed '
+            return jsonify({'message': message, 'status': 'failure'}), 400
+        
+        if reply.status_code != 200:
+            message = f'<ERROR> Server removal failed for server {replica[1]}'
+            return jsonify({'message': message, 'status': 'failure'}), 400
+
     mycursor.close()
     mydb.close()
+
+    for shard in shards_up_for_reelection:
+        reply = conduct_election(shard)
+        if reply['status'] != 'success':
+            return reply
 
     new_replicas = []
     replica_names = []
@@ -469,10 +563,11 @@ def remove():
         'servers': deleted_replica_names
     }
     replica_lock.release()
-    return jsonify({'message': message, 'status': 'successful'}), 200    
+    return jsonify({'message': message, 'status': 'success'}), 200    
 
 # Function to read data from a shard
 def read_shard_data(tid, shard, stud_id_low, stud_id_high, data):
+    
     shard_to_hrlock[shard].acquire()
     server = shard_to_hr[shard].get_server(random.randint(0, 999999))
     shard_to_hrlock[shard].release()
@@ -480,17 +575,39 @@ def read_shard_data(tid, shard, stud_id_low, stud_id_high, data):
     print(f"Read Thread {tid}: Shard {shard}, Server {server}",flush=True)
     if server == None:
         # return empty data
-        message = []
-        data[shard] = {'message': message, 'status': 'success'}
+        message = {
+            "data": [],
+            "status": "success"
+        }
+        data[shard] = message
         return
     
+    shard_datalock[shard]['noWaitingReaderLock'].acquire()
+    shard_datalock[shard]['waitingReaders'] += 1
+    shard_datalock[shard]['noWaitingReaderLock'].release()
+
+    shard_datalock[shard]['noWriterLock'].acquire()
+    while(shard_datalock[shard]['numWriters'] > 0):
+        shard_datalock[shard]['noWriterLock'].release()
+        time.sleep(0.2)
+        shard_datalock[shard]['noWriterLock'].acquire()
+    
+    shard_datalock[shard]['noReaderLock'].acquire()
+    shard_datalock[shard]['numReaders'] += 1
+    shard_datalock[shard]['noReaderLock'].release()
+    shard_datalock[shard]['noWaitingReaderLock'].acquire()
+    shard_datalock[shard]['waitingReaders'] -= 1
+    shard_datalock[shard]['noWaitingReaderLock'].release()
+
+    shard_datalock[shard]['noWriterLock'].release()          
+
     try:
-        server_locks[server].acquire()
+        # server_locks[server].acquire()
         reply = requests.post(f'http://{server}:{serverport}/read', json = {
             "shard": shard,
             "Stud_id": {"low": stud_id_low, "high": stud_id_high}
         })
-        server_locks[server].release()
+        # server_locks[server].release()
         data[shard] = reply.json()
         print(f"Read Thread {tid}: Data {data[shard]}",flush=True)
         if reply.status_code != 200:
@@ -499,6 +616,10 @@ def read_shard_data(tid, shard, stud_id_low, stud_id_high, data):
     except requests.exceptions.ConnectionError:
         message = '<ERROR> Server unavailable'
         data[shard] = {'message': message, 'status': 'failure'}
+
+    shard_datalock[shard]['noReaderLock'].acquire()
+    shard_datalock[shard]['numReaders'] -= 1
+    shard_datalock[shard]['noReaderLock'].release()
     
     print(f"Read Thread {tid}: Done",flush=True)
 
@@ -544,20 +665,6 @@ def read():
         shard = shards_list[i]
         shards_queried.append(id)
         data[id] = {}
-        # start the thread if no writer is waiting to write
-
-        shard_datalock[id]['noWriterLock'].acquire()
-        while(shard_datalock[id]['numWriters'] > 0):
-            shard_datalock[id]['noWriterLock'].release()
-            time.sleep(1)
-            shard_datalock[id]['noWriterLock'].acquire()
-        shard_datalock[id]['noWriterLock'].release()
-
-        shard_datalock[id]['noReaderLock'].acquire()
-        shard_datalock[id]['numReaders'] += 1
-        if shard_datalock[id]['numReaders'] == 1:
-            shard_datalock[id]['dataLock'].acquire()
-        shard_datalock[id]['noReaderLock'].release()
         
         t = threading.Thread(target = read_shard_data, args = (i, id, stud_id_low, stud_id_high, data))
         t.start()
@@ -566,15 +673,10 @@ def read():
 
     for t, id in threads:
         t.join()
-        shard_datalock[id]['noReaderLock'].acquire()
-        shard_datalock[id]['numReaders'] -= 1
-        if shard_datalock[id]['numReaders'] == 0:
-            shard_datalock[id]['dataLock'].release()
-        shard_datalock[id]['noReaderLock'].release()
-    
+        
     merged_data = []
     for shard in shards_list:
-        print('data: ', data, flush=True)
+        # print('data: ', data, flush=True)
         if data[shard[0]]['status'] == 'failure':
             message = '<ERROR> Server unavailable'
             return jsonify({'message': message, 'status': 'failure'}), 400
@@ -588,10 +690,8 @@ def read():
     }
     return jsonify(response), 200
 
-def write_shard_data(tid, shard, data_to_insert):
-    global write_results
+def write_shard_data(tid, shard, data_to_insert, primary_server, write_results):
     print(f"Write Thread {tid}: Shard {shard}",flush=True)
-    shard_to_hrlock[shard].acquire()
     
     # find all the servers having the shard
     mydb = mysql.connector.connect(
@@ -607,35 +707,90 @@ def write_shard_data(tid, shard, data_to_insert):
     mydb.close()
 
     if len(servers) == 0:
-        message = '<ERROR> No servers available for the shard'
-        write_results[tid] = {'message': message, 'status': 'failure'}
+        message = 'No servers available for the shard'
+        write_results[tid] = {'message': message, 'status': 'success', 'numEntries': len(data_to_insert)}
         return
     
+    shard_datalock[shard]['noReaderLock'].acquire()
+    while shard_datalock[shard]['numReaders'] > 0:
+        shard_datalock[shard]['noReaderLock'].release()
+        time.sleep(0.2)
+        shard_datalock[shard]['noReaderLock'].acquire()
+
+    shard_datalock[shard]['noReaderLock'].release()
+
+    shard_datalock[shard]['noWriterLock'].acquire()
+    shard_datalock[shard]['numWriters'] += 1
+    shard_datalock[shard]['noWriterLock'].release()
+
+    shard_datalock[shard]['dataLock'].acquire()
+
+    # Write log entry in the primary server
+    # Write data to all the servers
+    # Write data to the primary server
+    responses = {}
+    count_success = 0
+    data_payload = {
+        "shard": shard,
+        "curr_idx": 0,
+        "data": data_to_insert,
+        "mode": "log"
+    }
+    reply = requests.post(f'http://{primary_server}:{serverport}/write', json = data_payload)
+
     for server in servers:
+        if server[0] == primary_server[7:]:
+            continue
         server_name = f'Server_{server[0]}'
-        
         print(f"Write Thread {tid}: Shard {shard} Server {server_name}",flush=True)
         try:
-            server_locks[server_name].acquire()
             reply = requests.post(f'http://{server_name}:{serverport}/write', json = {
                 "shard": shard,
                 "curr_idx": 0,
-                "data": data_to_insert
+                "data": data_to_insert,
+                "mode": 'log_execute'
             })
-            server_locks[server_name].release()
             if reply.status_code != 200:
-                shard_to_hrlock[shard].release()
-                message = '<ERROR> Write failed'
-                write_results[tid] = {'message': message, 'status': 'failure'}
-                return
+                responses[server_name] = "Write failed"
+                continue
         except requests.exceptions.ConnectionError:
-            shard_to_hrlock[shard].release()
-            message = '<ERROR> Server unavailable'
-            write_results[tid] = {'message': message, 'status': 'failure'}
-            return
+            responses[server_name] = "Server unavailable"
+            continue
+        count_success += 1
+        responses[server_name] = "Write successful"
     
-    shard_to_hrlock[shard].release()
-    write_results[tid] = {'message': f'{len(data_to_insert)} Data entries added', 'status': 'success'}
+    if (count_success > len(servers) // 2):
+        # Write data to the primary server
+        try:
+            data_payload['mode'] = 'execute'
+            reply = requests.post(f'http://{primary_server}:{serverport}/write', json = data_payload)
+            if reply.status_code != 200:
+                responses[primary_server] = "Write failed"
+            # Write is successful
+            responses[primary_server] = "Write successful"
+            
+
+        except requests.exceptions.ConnectionError:
+            # Since primary server is down, we will elect a new primary server
+            responses[primary_server] = "Server unavailable"
+            conduct_election(shard)
+
+    else:
+        # Write failed
+        responses[primary_server] = "Write failed"
+
+
+
+
+
+
+    shard_datalock[shard]['dataLock'].release()
+
+    shard_datalock[shard]['noWriterLock'].acquire()
+    shard_datalock[shard]['numWriters'] -= 1
+    shard_datalock[shard]['noWriterLock'].release()
+
+    write_results[tid] = {'message': 'Data entries added', 'status': 'success', 'numEntries': len(data_to_insert)}
     print(f"Write Thread {tid}: Done",flush=True)
     return
 
@@ -650,28 +805,23 @@ def write():
 
     data = sorted(data, key=lambda x: x['Stud_id'])
     shards = []
-    try:
-        mydb = mysql.connector.connect(
-            host="localhost",
-            user="root",
-            password="abc",
-            database="loadbalancer"
-        )
+    
+    mydb = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="abc",
+        database="loadbalancer"
+    )
 
-        mycursor = mydb.cursor()
-        mycursor.execute("SELECT * FROM ShardT;")
-        shards = mycursor.fetchall()
+    mycursor = mydb.cursor()
+    mycursor.execute("SELECT * FROM ShardT;")
+    shards = mycursor.fetchall()
 
-        mycursor.close()
-        mydb.close()
-    except mysql.connector.Error as err:
-        return jsonify({'message': f'<ERROR> MySQL Error: {err}', 'status': 'failure'}), 500
-
+    mycursor.close()
+    mydb.close()
+    
     data_idx = 0
     threads = []
-    global write_results
-    global write_results_lock
-    write_results_lock.acquire()
     write_results = {}
 
     for i in range(len(shards)):
@@ -685,54 +835,43 @@ def write():
         if len(data_to_insert) == 0:
             write_results[i] = {'status': 'success', 'message': 'no data to insert'}
             continue
+        
+        primary_server = shard[3]
+        if primary_server == 'None':
+            message = '<ERROR> Primary server not elected'
+            return jsonify({'message': message, 'status': 'failure'}), 400
 
-        shard_datalock[id]['noWriterLock'].acquire()
-        shard_datalock[id]['numWriters'] += 1
-        shard_datalock[id]['noWriterLock'].release()
-
-        shard_datalock[id]['noReaderLock'].acquire()
-
-        while shard_datalock[id]['numReaders'] > 0:
-            shard_datalock[id]['noReaderLock'].release()
-            time.sleep(1)
-            shard_datalock[id]['noReaderLock'].acquire()
-
-        shard_datalock[id]['noReaderLock'].release()
-
-        shard_datalock[id]['dataLock'].acquire()
-        t = threading.Thread(target=write_shard_data, args=(i, id, data_to_insert))
+        t = threading.Thread(target=write_shard_data, args=(i, id, data_to_insert,primary_server,write_results))
         threads.append((t, id))
         t.start()
 
     for t, id in threads:
         t.join()
-        shard_datalock[id]['noWriterLock'].acquire()
-        shard_datalock[id]['numWriters'] -= 1
-        shard_datalock[id]['dataLock'].release()
-        shard_datalock[id]['noWriterLock'].release()
+
+    numEntries = len(data)
 
     for i in range(len(shards)):
         if i not in write_results:
             message = '<ERROR> No response received from the server, i not present'
-            write_results_lock.release()
             return jsonify({'message': message, 'status': 'failure'}), 400
         if 'status' not in write_results[i]:
             message = '<ERROR> \'status\' not present in write_results[i]'
-            write_results_lock.release()
             return jsonify({'message': message, 'status': 'failure'}), 400
         if write_results[i]['status'] == 'failure':
-            write_results_lock.release()
-            return jsonify(write_results[i]), 400
+            numEntries -= write_results[i]['numEntries']
 
-    write_results_lock.release()
+    if (numEntries == 0):
+        message = '<ERROR> No data entries added'
+        return jsonify({'message': message, 'status': 'failure'}), 400
+    
     response = {
-        "message": f"{len(data)} Data entries added",
-        "status": "success"
+        "message": f"{numEntries} Data entries added",
+        "status": "partial_success"
     }
 
     return jsonify(response), 200
 
-def update_shard_data(tid, shard, stud_id, new_data):
+def modify_shard_data(method, shard, stud_id, new_data):
     # find all the servers having the shard
     mydb = mysql.connector.connect(
         host="localhost",
@@ -752,21 +891,28 @@ def update_shard_data(tid, shard, stud_id, new_data):
     for server in servers:
         server_name = f'Server_{server[0]}'
         try:
-            server_locks[server_name].acquire()
-            reply = requests.put(f'http://{server_name}:{serverport}/update', json = {
-                "shard": shard,
-                "Stud_id": stud_id,
-                "data": new_data
-            })
-            server_locks[server_name].release()
+            if (method == 'Update'):
+                reply = requests.put(f'http://{server_name}:{serverport}/update', json = {
+                    "shard": shard,
+                    "Stud_id": stud_id,
+                    "data": new_data
+                })
+            elif (method == 'Delete'):
+                reply = requests.delete(f'http://{server_name}:{serverport}/del', json = {
+                    "shard": shard,
+                    "Stud_id": stud_id
+                })
             if reply.status_code != 200:
-                message = '<ERROR> Update failed'
+                message = f'<ERROR> {method} failed'
                 return jsonify({'message': message, 'status': 'failure'}), 400
         except requests.exceptions.ConnectionError:
             message = '<ERROR> Server unavailable'
             return jsonify({'message': message, 'status': 'failure'}), 400
         
-    return jsonify({'message': f"Data entry for Stud_id:{stud_id} updated", 'status':'success'}), 200
+    if method == 'Update':
+        return jsonify({'message': f"Data entry for Stud_id:{stud_id} updated", 'status':'success'}), 200
+    elif method == 'Delete':
+        return jsonify({'message': f"Data entry for Stud_id:{stud_id} deleted", 'status':'success'}), 200
 
 '''
 (/update, method=PUT):
@@ -797,7 +943,6 @@ def update():
     mydb.close()
     id = shard[0]
 
-    
     shard_datalock[id]['noWriterLock'].acquire()
     shard_datalock[id]['numWriters'] += 1
     shard_datalock[id]['noWriterLock'].release()
@@ -805,13 +950,13 @@ def update():
     shard_datalock[id]['noReaderLock'].acquire()
     while shard_datalock[id]['numReaders'] > 0:
         shard_datalock[id]['noReaderLock'].release()
-        time.sleep(1)
+        time.sleep(0.2)
         shard_datalock[id]['noReaderLock'].acquire()
 
     shard_datalock[id]['noReaderLock'].release()
 
     shard_datalock[id]['dataLock'].acquire()
-    response = update_shard_data(0, id, stud_id, new_data)
+    response = modify_shard_data('Update', id, stud_id, new_data)
     shard_datalock[id]['noWriterLock'].acquire()
     shard_datalock[id]['numWriters'] -= 1
     shard_datalock[id]['dataLock'].release()
@@ -820,7 +965,7 @@ def update():
 
     return response
 
-def delete_shard_data(tid, shard, stud_id):
+def delete_shard_data(method, shard, stud_id):
     # find all the servers having the shard
     mydb = mysql.connector.connect(
         host="localhost",
@@ -840,12 +985,12 @@ def delete_shard_data(tid, shard, stud_id):
     for server in servers:
         server_name = f'Server_{server[0]}'
         try:
-            server_locks[server_name].acquire()
+            # server_locks[server_name].acquire()
             reply = requests.delete(f'http://{server_name}:{serverport}/del', json = {
                 "shard": shard,
                 "Stud_id": stud_id
             })
-            server_locks[server_name].release()
+            # server_locks[server_name].release()
             if reply.status_code != 200:
                 message = '<ERROR> Delete failed'
                 return jsonify({'message': message, 'status': 'failure'}), 400
@@ -854,7 +999,6 @@ def delete_shard_data(tid, shard, stud_id):
             return jsonify({'message': message, 'status': 'failure'}), 400
         
     return jsonify({'message': f"Data entry for Stud_id:{stud_id} deleted", 'status':'success'}), 200
-
 
 '''
 (/del, method=DELETE):
@@ -890,14 +1034,14 @@ def delete():
     shard_datalock[shard]['noReaderLock'].acquire()
     while shard_datalock[shard]['numReaders'] > 0:
         shard_datalock[shard]['noReaderLock'].release()
-        time.sleep(1)
+        time.sleep(0.2)
         shard_datalock[shard]['noReaderLock'].acquire()
 
     shard_datalock[shard]['noReaderLock'].release()
 
     shard_datalock[shard]['dataLock'].acquire()
 
-    response = delete_shard_data(0, shard, Stud_id)
+    response = modify_shard_data('Delete', shard, Stud_id, '')
 
     shard_datalock[shard]['noWriterLock'].acquire()
     shard_datalock[shard]['numWriters'] -= 1
@@ -906,37 +1050,6 @@ def delete():
 
     return response
     
-    # # find all the servers having the shard
-    # mycursor.execute(f"SELECT Server_id FROM MapT WHERE Shard_id = '{shard}';")
-    # servers = mycursor.fetchall()
-
-    # if len(servers) == 0:
-    #     message = '<ERROR> No servers available for the shard'
-    #     return jsonify({'message': message, 'status': 'failure'}), 400
-    
-    # # delete the entry in all servers
-    # for server in servers:
-    #     server_name = f'Server_{server[0]}'
-    #     try:
-    #         server_locks[server_name].acquire()
-    #         reply = requests.delete(f'http://{server_name}:{serverport}/del', json = {
-    #             "shard": shard,
-    #             "Stud_id": Stud_id
-    #         })
-    #         server_locks[server_name].release()
-    #         if reply.status_code != 200:
-    #             message = '<ERROR> Delete failed'
-    #             return jsonify({'message': message, 'status': 'failure'}), 400
-    #     except requests.exceptions.ConnectionError:
-    #         message = '<ERROR> Server unavailable'
-    #         return jsonify({'message': message, 'status': 'failure'}), 400
-        
-    # entry deleted in all servers
-    mycursor.close()
-    mydb.close()
-    message = f"Data entry for Stud_id:{Stud_id} deleted"
-    return jsonify({'message': message, 'status':'success'}), 200
-
 @app.route('/read/<server>', methods=['GET'])
 def read_server(server):
     
@@ -983,17 +1096,9 @@ def read_server(server):
     mydb.close()
     return jsonify({'Data': data, 'status': 'success'}), 200
 
-'''
-'''
 def respawn_server(replica):
     print(f'Replica {replica[1]} is down',flush=True)
-    os.system(f'docker stop {replica[1]} && docker rm {replica[1]}')
-
     serverid = int(replica[1][7:])
-    os.system(f'docker run --name {replica[1]} --network mynet --network-alias {replica[1]} -e SERVER_ID={serverid} -d serverim:latest')
-    time.sleep(5)
-
-    print(f'DEBUG RESPAWN: Replica {replica[1]} respawned', flush=True)
     mydb = mysql.connector.connect(
         host="localhost",
         user="root",
@@ -1013,6 +1118,12 @@ def respawn_server(replica):
     # Remove the server from the MapT table
     mycursor.execute(f"DELETE FROM MapT WHERE Server_id = {serverid};")
     mydb.commit()
+
+    os.system(f'docker stop {replica[1]} && docker rm {replica[1]}')
+
+    os.system(f'docker run --name {replica[1]} --network mynet --network-alias {replica[1]} -e SERVER_ID={serverid} -d serverim:latest')
+    time.sleep(5)
+    print(f'DEBUG RESPAWN: Replica {replica[1]} respawned', flush=True)
 
     shards_list = []
     for shard in shards:
@@ -1038,6 +1149,7 @@ def respawn_server(replica):
         id = shard[0]
         shard_to_hrlock[id].acquire()
         server = shard_to_hr[id].get_server(random.randint(0, 999999))
+        shard_to_hrlock[id].release()
         shard_data = []
         try:
             reply = requests.get(f'http://{server}:{serverport}/copy', json = {
@@ -1061,11 +1173,9 @@ def respawn_server(replica):
                 "curr_idx": 0,
                 "data": shard_data
             })
-            shard_to_hrlock[id].release()
             if reply.status_code != 200:
                 return jsonify({'message': 'Data replication failed', 'status': 'failure'}), 400
         except requests.exceptions.ConnectionError:
-            shard_to_hrlock[id].release()
             message = '<ERROR> Server unavailable'
             return jsonify({'message': message, 'status': 'failure'}), 400
 
@@ -1113,7 +1223,7 @@ if __name__ == '__main__':
 
     num_servers = 0
     studT_schema = ""
-
+        
     # Setting up and spawning the thread that manages the replicas
     thread = threading.Thread(target=manage_replicas)
     thread.start()
