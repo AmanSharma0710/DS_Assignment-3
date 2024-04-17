@@ -11,6 +11,9 @@ CORS(app)
 
 # For testing purposes, you can set the server ID as an environment variable while running the container instance of the server.
 # os.environ['SERVER_ID'] = '1231'
+# Log Entry will follow the format: 
+# timestamp: 
+
 
 '''
 (/config,method=POST): This endpoint initializes the shard tables in the server database after the container
@@ -48,12 +51,9 @@ def config():
         elif dtypes[i] == 'String':
             dtypes[i] = 'VARCHAR(255)'
     for shard in shards:
-        # Create a table for each shard
-        # The table name is the shard name
-        # Assume that the first colummn is the primary key
-        mycursor.execute("CREATE TABLE {} ({} {} PRIMARY KEY);".format(shard, columns[0], dtypes[0]))
-        for i in range(1, len(columns)):
-            mycursor.execute("ALTER TABLE {} ADD COLUMN {} {};".format(shard, columns[i], dtypes[i]))
+        logger[shard] = Logger(server_id, shard)
+        mycursor.execute(f'CREATE TABLE {shard} (Stud_id INT PRIMARY KEY, Stud_name VARCHAR(255), Stud_marks INT);')
+        
     mydb.commit()
     mycursor.close()
     mydb.close()
@@ -149,6 +149,23 @@ def read():
     return jsonify({'data': response, 'status': 'success'}), 200
 
 
+def logQuery(shard, query, mode):
+    try:
+        if mode == 'log':
+            logger[shard].addLogEntry(query)
+        elif mode == 'execute':
+            executeSQLQuery(query)
+            logger[shard].addCommitEntry(query)
+        elif mode == 'log_execute':
+            logger[shard].addLogEntry(query)
+            executeSQLQuery(query)
+            logger[shard].addCommitEntry(query)
+    except Exception as e:
+        print(f'SERVER: {e}')
+        return False
+    return True
+
+
 '''
 (/write,method=POST): This endpoint writes the data to the shard table in the server database. It expects multiple entries and updates a curr_idx with the number of entries.
 Sample Payload Json:
@@ -177,10 +194,14 @@ def write():
     shard = data['shard']
     curr_idx = data['curr_idx']
     entries = data['data']
+    mode = data['mode']
     for entry in entries:
         columns = ', '.join(entry.keys())
         values = ', '.join(['"{}"'.format(str(x)) for x in entry.values()])
-        mycursor.execute("INSERT INTO {} ({}) VALUES ({});".format(shard, columns, values))
+        query = 'INSERT INTO {} ({}) VALUES ({});'.format(shard, columns, values)
+        if not logQuery(shard, query, mode):
+            return jsonify({'message': 'Error in logging query', 'status': 'failure'}), 500
+        
     mydb.commit()
     mycursor.close()
     mydb.close()
@@ -253,6 +274,66 @@ def delete():
     mydb.close()
     return jsonify({'message': 'Data entry with Stud_id:{} removed'.format(Stud_id), 'status': 'success'}), 200
 
+@app.route('/vote/<shard_id>', methods=['GET'])
+def vote(shard_id):
+    # get the election index from logger object of the shard id
+    electionIndex = logger[shard_id].getElectionIndex()
+    return jsonify({'vote': electionIndex}), 200
+
+@app.route('/logs/<shard_id>', methods=['GET'])
+def logs(shard_id):
+    # get the logs from logger object of the shard id
+    logs = logger[shard_id].getLogs()
+    return jsonify({'logs': logs}), 200
+
+def executeSQLQuery(query):
+    mydb = mysql.connector.connect(
+        host="localhost",
+        user="root",
+        password="abc",
+        database="shards")
+    mycursor = mydb.cursor(dictionary=True)
+    mycursor.execute(query)
+    response = mycursor.fetchall()
+    mydb.commit()
+    mycursor.close()
+    mydb.close()
+    return response
+
+@app.route('/replicate/<shard_id>', methods=['POST'])
+def replicate(shard_id):
+    payload = request.json
+    logs = payload['logs']
+
+    # delete the existing logger object
+    del logger[shard_id]
+
+    # create a new log file
+    logger[shard_id] = Logger(os.environ['SERVER_ID'], shard_id)
+    for log in logs:
+        # parse the log into components: "timestamp: log_id: message: checksum"
+        # timestamp is of the form "YYYY-MM-DD HH:MM:SS"
+        print(f'SERVER: {log}')
+        components = log.split(': ')
+        checksum = components[-1]
+        message = components[-2]
+        log_id = components[-3]
+        print(f'SERVER: {log_id} {message} {checksum}')
+        
+        # check if the log is valid
+        if hash(f'{log_id}: {message}') != int(checksum):
+            print('SERVER: Invalid log entry')
+            continue
+            
+        # if message == "COMMIT" then execute the query
+        # else add the log entry to uncommited logs
+        if message == 'COMMIT':
+            logger[shard_id].addCommitEntry(message)
+            executeSQLQuery(message)
+        else:
+            logger[shard_id].addLogEntry(message)
+    return jsonify({'message': 'Logs replicated successfully'}), 200
+
 
 if __name__ == '__main__':
     
@@ -271,12 +352,9 @@ if __name__ == '__main__':
     mycursor.close()
     mydb.close()
 
+    logger = {}
+
     # create a logs directory
     os.makedirs('logs', exist_ok=True)
-    # Initialize the logger
-    # Log = Logger(os.environ['SERVER_ID'])
-
-    # Log messages follow the format:
-    # "timestamp: endpoint, payload: {}"`
 
     app.run(host='0.0.0.0', port=5000, debug=True)

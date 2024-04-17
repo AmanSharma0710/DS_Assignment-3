@@ -13,10 +13,24 @@ services:
     container_name: loadbalancer
     ports:
       - "5000:5000"
+    privileged: true
+    networks:
+      mynet:
+        aliases:  
+          - loadbalancer
+
+  shardmanager: 
+    build: 
+      context: ./
+      dockerfile: ./shardmanager/Dockerfile
+    image: shardmanagerim
+    container_name: shardmanager
+    ports:
+      - "5001:5001"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:z
     privileged: true
     networks:
       mynet:
         aliases:  
-          - loadbalancer
+          - shardmanager
