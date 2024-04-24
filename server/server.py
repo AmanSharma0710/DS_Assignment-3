@@ -14,6 +14,18 @@ CORS(app)
 # Log Entry will follow the format: 
 # timestamp: 
 
+def connect_to_db():
+    mydb = mysql.connector.connect(
+        host="localhost", 
+        user="root",
+        password="abc",
+        database="shards")
+    mycursor = mydb.cursor(dictionary=True)
+    return mydb, mycursor
+
+def close_db(mydb, mycursor):
+    mycursor.close()
+    mydb.close()
 
 '''
 (/config,method=POST): This endpoint initializes the shard tables in the server database after the container
@@ -33,12 +45,7 @@ Response Code = 200
 ''' 
 @app.route('/config', methods=['POST'])
 def config():
-    mydb = mysql.connector.connect(
-        host="localhost", 
-        user="root",
-        password="abc",
-        database="shards")
-    mycursor = mydb.cursor(dictionary=True)
+    mydb, mycursor = connect_to_db()
     data = request.json
     shards = data['shards']
     schema = data['schema']
@@ -55,8 +62,7 @@ def config():
         mycursor.execute(f'CREATE TABLE {shard} (Stud_id INT PRIMARY KEY, Stud_name VARCHAR(255), Stud_marks INT);')
         
     mydb.commit()
-    mycursor.close()
-    mydb.close()
+    close_db(mydb, mycursor)
     message = ''
     for i in range(len(shards)):
         message += 'Server{}:{}'.format(server_id, shards[i])
@@ -94,12 +100,7 @@ Response Code = 200
 '''
 @app.route('/copy', methods=['GET'])
 def copy():
-    mydb = mysql.connector.connect(
-        host="localhost", 
-        user="root",
-        password="abc",
-        database="shards")
-    mycursor = mydb.cursor(dictionary=True)
+    mydb, mycursor = connect_to_db()
     data = request.json
     shards = data['shards']
     response = {}
@@ -107,8 +108,7 @@ def copy():
         mycursor.execute("SELECT * FROM {};".format(shard))
         response[shard] = mycursor.fetchall()
     response['status'] = 'success'
-    mycursor.close()
-    mydb.close()
+    close_db(mydb, mycursor)
     return jsonify(response), 200
 
 '''
@@ -131,40 +131,39 @@ Response Code = 200
 '''
 @app.route('/read', methods=['POST'])
 def read():
-    mydb = mysql.connector.connect(
-        host="localhost", 
-        user="root",
-        password="abc",
-        database="shards")
-    mycursor = mydb.cursor(dictionary=True)
+    mydb, mycursor = connect_to_db()
     data = request.json
     shard = data['shard']
     low = data['Stud_id']['low']
     high = data['Stud_id']['high']
     mycursor.execute("SELECT * FROM {} WHERE Stud_id BETWEEN {} AND {};".format(shard, low, high))
     response = mycursor.fetchall()
-    mycursor.close()
-    mydb.close()
+    close_db(mydb, mycursor)
     response = response if (len(response) > 0) else []
     return jsonify({'data': response, 'status': 'success'}), 200
 
 
 def logQuery(shard, query, mode):
+    mydb, mycursor = connect_to_db()
     try:
+        print(f'SERVER: MODE: {mode} LOG QUERY: {query}', flush=True)
         if mode == 'log':
             logger[shard].addLogEntry(query)
         elif mode == 'execute':
-            executeSQLQuery(query)
+            mycursor.execute(query)
             logger[shard].addCommitEntry(query)
         elif mode == 'log_execute':
             logger[shard].addLogEntry(query)
-            executeSQLQuery(query)
+            mycursor.execute(query)
             logger[shard].addCommitEntry(query)
     except Exception as e:
-        print(f'SERVER: {e}')
+        close_db(mydb, mycursor)
+        # Print the exception
+        print(f'SERVER: ERROR: {str(e)}', flush=True)
         return False
+    mydb.commit()
+    close_db(mydb, mycursor)
     return True
-
 
 '''
 (/write,method=POST): This endpoint writes the data to the shard table in the server database. It expects multiple entries and updates a curr_idx with the number of entries.
@@ -184,12 +183,6 @@ Response Code = 200
 '''
 @app.route('/write', methods=['POST'])
 def write():
-    mydb = mysql.connector.connect(
-        host="localhost", 
-        user="root",
-        password="abc",
-        database="shards")
-    mycursor = mydb.cursor(dictionary=True)
     data = request.json
     shard = data['shard']
     curr_idx = data['curr_idx']
@@ -201,10 +194,6 @@ def write():
         query = 'INSERT INTO {} ({}) VALUES ({});'.format(shard, columns, values)
         if not logQuery(shard, query, mode):
             return jsonify({'message': 'Error in logging query', 'status': 'failure'}), 500
-        
-    mydb.commit()
-    mycursor.close()
-    mydb.close()
     return jsonify({'message': 'Data entries added', 'current_idx': curr_idx + len(entries), 'status': 'success'}), 200
 
 
@@ -225,21 +214,17 @@ Response Code = 200
 '''
 @app.route('/update', methods=['PUT'])
 def update():
-    mydb = mysql.connector.connect(
-        host="localhost", 
-        user="root",
-        password="abc",
-        database="shards")
-    mycursor = mydb.cursor(dictionary=True)
+    mydb, mycursor = connect_to_db()
     data = request.json
     shard = data['shard']
     Stud_id = data['Stud_id']
     entry = data['data']
+    mode = data['mode']
     update = ', '.join(['{} = "{}"'.format(k, v) for k, v in entry.items()])
-    mycursor.execute("UPDATE {} SET {} WHERE Stud_id = {}".format(shard, update, Stud_id))
-    mydb.commit()
-    mycursor.close()
-    mydb.close()
+    query = f'UPDATE {shard} SET {update} WHERE Stud_id = {Stud_id};'
+    if not logQuery(shard, query, mode):
+        return jsonify({'message': 'Error in logging query', 'status': 'failure'}), 500
+    close_db(mydb, mycursor)    
     return jsonify({'message': 'Data entry for Stud_id:{} updated'.format(Stud_id), 'status': 'success'}), 200
 
 
@@ -259,19 +244,15 @@ Response Code = 200
 '''
 @app.route('/del', methods=['DELETE'])
 def delete():
-    mydb = mysql.connector.connect(
-        host="localhost", 
-        user="root",
-        password="abc",
-        database="shards")
-    mycursor = mydb.cursor(dictionary=True)
+    mydb, mycursor = connect_to_db()
     data = request.json
     shard = data['shard']
     Stud_id = data['Stud_id']
-    mycursor.execute("DELETE FROM {} WHERE Stud_id = {}".format(shard, Stud_id))
-    mydb.commit()
-    mycursor.close()
-    mydb.close()
+    mode = data['mode']
+    query = f'DELETE FROM {shard} WHERE Stud_id = {Stud_id};'
+    if not logQuery(shard, query, mode):
+        return jsonify({'message': 'Error in logging query', 'status': 'failure'}), 500
+    close_db(mydb, mycursor)
     return jsonify({'message': 'Data entry with Stud_id:{} removed'.format(Stud_id), 'status': 'success'}), 200
 
 @app.route('/vote/<shard_id>', methods=['GET'])
@@ -286,52 +267,33 @@ def logs(shard_id):
     logs = logger[shard_id].getLogs()
     return jsonify({'logs': logs}), 200
 
-def executeSQLQuery(query):
-    mydb = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="abc",
-        database="shards")
-    mycursor = mydb.cursor(dictionary=True)
-    mycursor.execute(query)
-    response = mycursor.fetchall()
-    mydb.commit()
-    mycursor.close()
-    mydb.close()
-    return response
-
 @app.route('/replicate/<shard_id>', methods=['POST'])
 def replicate(shard_id):
     payload = request.json
     logs = payload['logs']
 
-    # delete the existing logger object
-    del logger[shard_id]
+    logger[shard_id].resetLogs()
 
-    # create a new log file
-    logger[shard_id] = Logger(os.environ['SERVER_ID'], shard_id)
     for log in logs:
-        # parse the log into components: "timestamp: log_id: message: checksum"
+        # parse the log into components: "timestamp: log_id: message"
         # timestamp is of the form "YYYY-MM-DD HH:MM:SS"
-        print(f'SERVER: {log}')
-        components = log.split(': ')
-        checksum = components[-1]
-        message = components[-2]
-        log_id = components[-3]
-        print(f'SERVER: {log_id} {message} {checksum}')
-        
-        # check if the log is valid
-        if hash(f'{log_id}: {message}') != int(checksum):
-            print('SERVER: Invalid log entry')
-            continue
-            
-        # if message == "COMMIT" then execute the query
-        # else add the log entry to uncommited logs
+        # remove the newline character from the log
+        log = log.strip()
+        components = str(log).split(': ')
+        message = components[-1]
+        log_id = components[-2]
+        log_id = int(log_id)
+        # strip the message of whitespace
+        message = message.strip()
+
+        # if the message is a COMMIT message, get the log message from the log_id
         if message == 'COMMIT':
-            logger[shard_id].addCommitEntry(message)
-            executeSQLQuery(message)
-        else:
-            logger[shard_id].addLogEntry(message)
+            query = logger[shard_id].getLogMessage(log_id)
+            logQuery(shard_id, query, 'execute')
+            continue
+        
+        logger[shard_id].addLogEntry(message)
+
     return jsonify({'message': 'Logs replicated successfully'}), 200
 
 
@@ -357,4 +319,4 @@ if __name__ == '__main__':
     # create a logs directory
     os.makedirs('logs', exist_ok=True)
 
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)
