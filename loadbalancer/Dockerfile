@@ -5,7 +5,6 @@ RUN apt-get install -y python3
 RUN apt-get install -y python3-pip
 RUN pip install --upgrade pip
 RUN apt-get install -y default-mysql-server
-RUN apt-get install -y docker.io
 
 COPY ./loadbalancer ./loadbalancer
 COPY ./utils /utils
